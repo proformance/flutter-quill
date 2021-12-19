@@ -1,11 +1,8 @@
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import '../../flutter_quill.dart';
 
-import '../models/documents/nodes/leaf.dart';
-import 'editor.dart';
 import 'text_selection.dart';
 
 typedef EmbedBuilder = Widget Function(
@@ -79,9 +76,8 @@ class EditorTextSelectionGestureDetectorBuilder {
   void onSingleLongTapStart(LongPressStartDetails details) {
     if (delegate.getSelectionEnabled()) {
       getRenderEditor()!.selectPositionAt(
-        details.globalPosition,
-        null,
-        SelectionChangedCause.longPress,
+        from: details.globalPosition,
+        cause: SelectionChangedCause.longPress,
       );
     }
   }
@@ -89,9 +85,8 @@ class EditorTextSelectionGestureDetectorBuilder {
   void onSingleLongTapMoveUpdate(LongPressMoveUpdateDetails details) {
     if (delegate.getSelectionEnabled()) {
       getRenderEditor()!.selectPositionAt(
-        details.globalPosition,
-        null,
-        SelectionChangedCause.longPress,
+        from: details.globalPosition,
+        cause: SelectionChangedCause.longPress,
       );
     }
   }
@@ -112,23 +107,18 @@ class EditorTextSelectionGestureDetectorBuilder {
   }
 
   void onDragSelectionStart(DragStartDetails details) {
-    getRenderEditor()!.selectPositionAt(
-      details.globalPosition,
-      null,
-      SelectionChangedCause.drag,
-    );
+    getRenderEditor()!.handleDragStart(details);
   }
 
   void onDragSelectionUpdate(
       DragStartDetails startDetails, DragUpdateDetails updateDetails) {
-    getRenderEditor()!.selectPositionAt(
-      startDetails.globalPosition,
-      updateDetails.globalPosition,
-      SelectionChangedCause.drag,
-    );
+    getRenderEditor()!.extendSelection(updateDetails.globalPosition,
+        cause: SelectionChangedCause.drag);
   }
 
-  void onDragSelectionEnd(DragEndDetails details) {}
+  void onDragSelectionEnd(DragEndDetails details) {
+    getRenderEditor()!.handleDragEnd(details);
+  }
 
   Widget build(HitTestBehavior behavior, Widget child) {
     return EditorTextSelectionGestureDetector(
