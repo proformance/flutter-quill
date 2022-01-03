@@ -1,3 +1,28 @@
+# [3.0.4]
+* Add maxContentWidth constraint to editor.
+
+# [3.0.3]
+* Do not show caret on screen when the editor is not focused.
+
+# [3.0.2]
+* Fix launch link for read-only mode.
+
+## [3.0.1]
+* Handle null value of Attribute.link.
+
+## [3.0.0]
+* Launch link improvements.
+* Removed QuillSimpleViewer.
+
+## [2.5.2]
+* Skip image when pasting.
+
+## [2.5.1]
+* Bug fix for Desktop `Shift` + `Click` support.
+
+## [2.5.0]
+* Update checkbox list.
+
 ## [2.4.1]
 * Desktop selection improvements.
 
