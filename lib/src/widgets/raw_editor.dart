@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/cupertino.dart';
@@ -11,16 +12,21 @@ import 'package:flutter/services.dart';
 import 'package:flutter_keyboard_visibility/flutter_keyboard_visibility.dart';
 import 'package:tuple/tuple.dart';
 
-import '../../models/documents/nodes/node.dart';
 import '../models/documents/attribute.dart';
 import '../models/documents/document.dart';
 import '../models/documents/nodes/block.dart';
+import '../models/documents/nodes/embeddable.dart';
 import '../models/documents/nodes/line.dart';
+import '../models/documents/nodes/node.dart';
+import '../models/documents/style.dart';
+import '../utils/platform.dart';
 import 'controller.dart';
 import 'cursor.dart';
 import 'default_styles.dart';
 import 'delegate.dart';
 import 'editor.dart';
+import 'embeds/default_embed_builder.dart';
+import 'embeds/image.dart';
 import 'keyboard_listener.dart';
 import 'link.dart';
 import 'proxy.dart';
@@ -238,7 +244,7 @@ class RawEditorState extends EditorState
 
   // Selection overlay
   @override
-  EditorTextSelectionOverlay? getSelectionOverlay() => _selectionOverlay;
+  EditorTextSelectionOverlay? get selectionOverlay => _selectionOverlay;
   EditorTextSelectionOverlay? _selectionOverlay;
 
   @override
@@ -255,6 +261,14 @@ class RawEditorState extends EditorState
 
   // Theme
   DefaultStyles? _styles;
+
+  // for pasting style
+  @override
+  List<Tuple2<int, Style>> get pasteStyle => _pasteStyle;
+  List<Tuple2<int, Style>> _pasteStyle = <Tuple2<int, Style>>[];
+  @override
+  String get pastePlainText => _pastePlainText;
+  String _pastePlainText = '';
 
   final ClipboardStatusNotifier _clipboardStatus = ClipboardStatusNotifier();
   final LayerLink _toolbarLayerLink = LayerLink();
@@ -283,11 +297,13 @@ class RawEditorState extends EditorState
           document: _doc,
           selection: widget.controller.selection,
           hasFocus: _hasFocus,
+          scrollable: widget.scrollable,
           cursorController: _cursorCont,
           textDirection: _textDirection,
           startHandleLayerLink: _startHandleLayerLink,
           endHandleLayerLink: _endHandleLayerLink,
           onSelectionChanged: _handleSelectionChanged,
+          onSelectionCompleted: _handleSelectionCompleted,
           scrollBottomInset: widget.scrollBottomInset,
           padding: widget.padding,
           maxContentWidth: widget.maxContentWidth,
@@ -298,6 +314,12 @@ class RawEditorState extends EditorState
     );
 
     if (widget.scrollable) {
+      /// Since [SingleChildScrollView] does not implement
+      /// `computeDistanceToActualBaseline` it prevents the editor from
+      /// providing its baseline metrics. To address this issue we wrap
+      /// the scroll view with [BaselineProxy] which mimics the editor's
+      /// baseline.
+      // This implies that the first line has no styles applied to it.
       final baselinePadding =
           EdgeInsets.only(top: _styles!.paragraph!.verticalSpacing.item1);
       child = BaselineProxy(
@@ -311,13 +333,15 @@ class RawEditorState extends EditorState
             child: _Editor(
               key: _editorKey,
               offset: offset,
-              document: widget.controller.document,
+              document: _doc,
               selection: widget.controller.selection,
               hasFocus: _hasFocus,
+              scrollable: widget.scrollable,
               textDirection: _textDirection,
               startHandleLayerLink: _startHandleLayerLink,
               endHandleLayerLink: _endHandleLayerLink,
               onSelectionChanged: _handleSelectionChanged,
+              onSelectionCompleted: _handleSelectionCompleted,
               scrollBottomInset: widget.scrollBottomInset,
               padding: widget.padding,
               maxContentWidth: widget.maxContentWidth,
@@ -374,12 +398,31 @@ class RawEditorState extends EditorState
     }
   }
 
+  void _handleSelectionCompleted() {
+    widget.controller.onSelectionCompleted?.call();
+  }
+
   /// Updates the checkbox positioned at [offset] in document
   /// by changing its attribute according to [value].
   void _handleCheckboxTap(int offset, bool value) {
     if (!widget.readOnly) {
-      widget.controller.formatText(
-          offset, 0, value ? Attribute.checked : Attribute.unchecked);
+      _disableScrollControllerAnimateOnce = true;
+      final attribute = value ? Attribute.checked : Attribute.unchecked;
+
+      widget.controller.formatText(offset, 0, attribute);
+
+      // Checkbox tapping causes controller.selection to go to offset 0
+      // Stop toggling those two toolbar buttons
+      widget.controller.toolbarButtonToggler = {
+        Attribute.list.key: attribute,
+        Attribute.header.key: Attribute.header
+      };
+
+      // Go back from offset 0 to current selection
+      SchedulerBinding.instance!.addPostFrameCallback((_) {
+        widget.controller.updateSelection(
+            TextSelection.collapsed(offset: offset), ChangeSource.LOCAL);
+      });
     }
   }
 
@@ -511,19 +554,23 @@ class RawEditorState extends EditorState
     _floatingCursorResetController = AnimationController(vsync: this);
     _floatingCursorResetController.addListener(onFloatingCursorResetTick);
 
-    if (defaultTargetPlatform == TargetPlatform.windows ||
-        defaultTargetPlatform == TargetPlatform.macOS ||
-        defaultTargetPlatform == TargetPlatform.linux ||
-        defaultTargetPlatform == TargetPlatform.fuchsia) {
+    if (isKeyboardOS()) {
       _keyboardVisible = true;
     } else {
-      _keyboardVisibilityController = KeyboardVisibilityController();
-      _keyboardVisible = _keyboardVisibilityController!.isVisible;
-      _keyboardVisibilitySubscription =
-          _keyboardVisibilityController?.onChange.listen((visible) {
-        _keyboardVisible = visible;
-        if (visible) {
-          _onChangeTextEditingValue(!_hasFocus);
+      // treat iOS Simulator like a keyboard OS
+      isIOSSimulator().then((isIosSimulator) {
+        if (isIosSimulator) {
+          _keyboardVisible = true;
+        } else {
+          _keyboardVisibilityController = KeyboardVisibilityController();
+          _keyboardVisible = _keyboardVisibilityController!.isVisible;
+          _keyboardVisibilitySubscription =
+              _keyboardVisibilityController?.onChange.listen((visible) {
+            _keyboardVisible = visible;
+            if (visible) {
+              _onChangeTextEditingValue(!_hasFocus);
+            }
+          });
         }
       });
     }
@@ -589,6 +636,11 @@ class RawEditorState extends EditorState
       if (oldWidget.readOnly && _hasFocus) {
         openConnectionIfNeeded();
       }
+    }
+
+    // in case customStyles changed in new widget
+    if (widget.customStyles != null) {
+      _styles = _styles!.merge(widget.customStyles!);
     }
   }
 
@@ -678,15 +730,13 @@ class RawEditorState extends EditorState
 
   void _updateOrDisposeSelectionOverlayIfNeeded() {
     if (_selectionOverlay != null) {
-      if (_hasFocus && !textEditingValue.selection.isCollapsed) {
-        _selectionOverlay!.update(textEditingValue);
-      } else {
+      if (!_hasFocus) {
         _selectionOverlay!.dispose();
         _selectionOverlay = null;
+      } else if (!textEditingValue.selection.isCollapsed) {
+        _selectionOverlay!.update(textEditingValue);
       }
     } else if (_hasFocus) {
-      _selectionOverlay?.hide();
-
       _selectionOverlay = EditorTextSelectionOverlay(
         value: textEditingValue,
         context: context,
@@ -694,7 +744,7 @@ class RawEditorState extends EditorState
         toolbarLayerLink: _toolbarLayerLink,
         startHandleLayerLink: _startHandleLayerLink,
         endHandleLayerLink: _endHandleLayerLink,
-        renderObject: getRenderEditor(),
+        renderObject: renderEditor,
         selectionCtrls: widget.selectionCtrls,
         selectionDelegate: this,
         clipboardStatus: _clipboardStatus,
@@ -733,6 +783,13 @@ class RawEditorState extends EditorState
 
   bool _showCaretOnScreenScheduled = false;
 
+  // This is a workaround for checkbox tapping issue
+  // https://github.com/singerdmx/flutter-quill/issues/619
+  // We cannot treat {"list": "checked"} and {"list": "unchecked"} as
+  // block of the same style
+  // This causes controller.selection to go to offset 0
+  bool _disableScrollControllerAnimateOnce = false;
+
   void _showCaretOnScreen() {
     if (!widget.showCursor || _showCaretOnScreenScheduled) {
       return;
@@ -743,8 +800,7 @@ class RawEditorState extends EditorState
       if (widget.scrollable || _scrollController.hasClients) {
         _showCaretOnScreenScheduled = false;
 
-        final renderEditor = getRenderEditor();
-        if (renderEditor == null) {
+        if (!mounted) {
           return;
         }
 
@@ -760,6 +816,10 @@ class RawEditorState extends EditorState
         );
 
         if (offset != null) {
+          if (_disableScrollControllerAnimateOnce) {
+            _disableScrollControllerAnimateOnce = false;
+            return;
+          }
           _scrollController.animateTo(
             math.min(offset, _scrollController.position.maxScrollExtent),
             duration: const Duration(milliseconds: 100),
@@ -770,10 +830,12 @@ class RawEditorState extends EditorState
     });
   }
 
+  /// The renderer for this widget's editor descendant.
+  ///
+  /// This property is typically used to notify the renderer of input gestures.
   @override
-  RenderEditor? getRenderEditor() {
-    return _editorKey.currentContext?.findRenderObject() as RenderEditor?;
-  }
+  RenderEditor get renderEditor =>
+      _editorKey.currentContext?.findRenderObject() as RenderEditor;
 
   @override
   void requestKeyboard() {
@@ -793,11 +855,14 @@ class RawEditorState extends EditorState
     }
     textEditingValue = value;
     userUpdateTextEditingValue(value, cause);
+
+    // keyboard and text input force a selection completion
+    _handleSelectionCompleted();
   }
 
   @override
   void debugAssertLayoutUpToDate() {
-    getRenderEditor()!.debugAssertLayoutUpToDate();
+    renderEditor.debugAssertLayoutUpToDate();
   }
 
   /// Shows the selection toolbar at the location of the current cursor.
@@ -824,36 +889,35 @@ class RawEditorState extends EditorState
 
   @override
   void copySelection(SelectionChangedCause cause) {
+    widget.controller.copiedImageUrl = null;
+    _pastePlainText = widget.controller.getPlainText();
+    _pasteStyle = widget.controller.getAllIndividualSelectionStyles();
     // Copied straight from EditableTextState
     super.copySelection(cause);
     if (cause == SelectionChangedCause.toolbar) {
       bringIntoView(textEditingValue.selection.extent);
       hideToolbar(false);
 
-      switch (defaultTargetPlatform) {
-        case TargetPlatform.iOS:
-          break;
-        case TargetPlatform.macOS:
-        case TargetPlatform.android:
-        case TargetPlatform.fuchsia:
-        case TargetPlatform.linux:
-        case TargetPlatform.windows:
-          // Collapse the selection and hide the toolbar and handles.
-          userUpdateTextEditingValue(
-            TextEditingValue(
-              text: textEditingValue.text,
-              selection: TextSelection.collapsed(
-                  offset: textEditingValue.selection.end),
-            ),
-            SelectionChangedCause.toolbar,
-          );
-          break;
+      if (!Platform.isIOS) {
+        // Collapse the selection and hide the toolbar and handles.
+        userUpdateTextEditingValue(
+          TextEditingValue(
+            text: textEditingValue.text,
+            selection:
+                TextSelection.collapsed(offset: textEditingValue.selection.end),
+          ),
+          SelectionChangedCause.toolbar,
+        );
       }
     }
   }
 
   @override
   void cutSelection(SelectionChangedCause cause) {
+    widget.controller.copiedImageUrl = null;
+    _pastePlainText = widget.controller.getPlainText();
+    _pasteStyle = widget.controller.getAllIndividualSelectionStyles();
+
     // Copied straight from EditableTextState
     super.cutSelection(cause);
     if (cause == SelectionChangedCause.toolbar) {
@@ -864,8 +928,26 @@ class RawEditorState extends EditorState
 
   @override
   Future<void> pasteText(SelectionChangedCause cause) async {
+    if (widget.controller.copiedImageUrl != null) {
+      final index = textEditingValue.selection.baseOffset;
+      final length = textEditingValue.selection.extentOffset - index;
+      final copied = widget.controller.copiedImageUrl!;
+      widget.controller
+          .replaceText(index, length, BlockEmbed.image(copied.item1), null);
+      if (copied.item2.isNotEmpty) {
+        widget.controller.formatText(
+            getImageNode(widget.controller, index + 1).item1,
+            1,
+            StyleAttribute(copied.item2));
+      }
+      widget.controller.copiedImageUrl = null;
+      await Clipboard.setData(const ClipboardData(text: ''));
+      return;
+    }
+
     // Copied straight from EditableTextState
     super.pasteText(cause); // ignore: unawaited_futures
+
     if (cause == SelectionChangedCause.toolbar) {
       bringIntoView(textEditingValue.selection.extent);
       hideToolbar();
@@ -894,7 +976,7 @@ class RawEditorState extends EditorState
   bool get readOnly => widget.readOnly;
 
   @override
-  TextLayoutMetrics get textLayoutMetrics => getRenderEditor()!;
+  TextLayoutMetrics get textLayoutMetrics => renderEditor;
 
   @override
   AnimationController get floatingCursorResetController =>
@@ -910,10 +992,12 @@ class _Editor extends MultiChildRenderObjectWidget {
     required this.document,
     required this.textDirection,
     required this.hasFocus,
+    required this.scrollable,
     required this.selection,
     required this.startHandleLayerLink,
     required this.endHandleLayerLink,
     required this.onSelectionChanged,
+    required this.onSelectionCompleted,
     required this.scrollBottomInset,
     required this.cursorController,
     required this.floatingCursorDisabled,
@@ -926,10 +1010,12 @@ class _Editor extends MultiChildRenderObjectWidget {
   final Document document;
   final TextDirection textDirection;
   final bool hasFocus;
+  final bool scrollable;
   final TextSelection selection;
   final LayerLink startHandleLayerLink;
   final LayerLink endHandleLayerLink;
   final TextSelectionChangedHandler onSelectionChanged;
+  final TextSelectionCompletedHandler onSelectionCompleted;
   final double scrollBottomInset;
   final EdgeInsetsGeometry padding;
   final double? maxContentWidth;
@@ -943,10 +1029,12 @@ class _Editor extends MultiChildRenderObjectWidget {
         document: document,
         textDirection: textDirection,
         hasFocus: hasFocus,
+        scrollable: scrollable,
         selection: selection,
         startHandleLayerLink: startHandleLayerLink,
         endHandleLayerLink: endHandleLayerLink,
         onSelectionChanged: onSelectionChanged,
+        onSelectionCompleted: onSelectionCompleted,
         cursorController: cursorController,
         padding: padding,
         maxContentWidth: maxContentWidth,
